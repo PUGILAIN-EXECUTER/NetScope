@@ -1,12 +1,22 @@
 import os
 import sys
 import time
+import json
 import socket
 import ctypes
+import sqlite3
+import platform
 import threading
-import subprocess
+import ipaddress
 from datetime import datetime
 from collections import defaultdict, deque
+
+try:
+    import psutil
+except ImportError:
+    print("psutil is not installed.")
+    print("Run: python -m pip install psutil")
+    sys.exit(1)
 
 try:
     from scapy.all import (
@@ -21,15 +31,15 @@ try:
         get_if_addr,
         get_if_hwaddr,
         get_if_list,
-        get_working_ifaces,
-        send,
-        sniff
+        conf,
+        srp,
+        sniff,
+        wrpcap
     )
 except ImportError:
     print("Scapy is not installed.")
     print("Run: python -m pip install scapy")
     sys.exit(1)
-
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -46,10 +56,13 @@ running = True
 capture_error = ""
 selected_interface = None
 local_address = "unknown"
+local_netmask = None
+local_network = None
+local_gateway = None
 
 lock = threading.RLock()
 
-events = deque(maxlen=300)
+events = deque(maxlen=500)
 devices = {}
 domains = defaultdict(int)
 connections = defaultdict(int)
@@ -58,13 +71,27 @@ packet_count = 0
 dns_count = 0
 connection_count = 0
 device_count = 0
+arp_count = 0
+ipv4_count = 0
+ipv6_count = 0
+tcp_count = 0
+udp_count = 0
+bytes_count = 0
 
 last_event_id = 0
+
+DB_FILE = "netscope.db"
+EXPORT_FILE = "netscope_export.json"
+
+db_lock = threading.RLock()
 
 
 def is_admin():
     if os.name != "nt":
-        return os.geteuid() == 0
+        try:
+            return os.geteuid() == 0
+        except Exception:
+            return False
 
     try:
         return bool(
@@ -81,15 +108,11 @@ def clear():
 
 
 def now():
-    return datetime.now().strftime(
-        "%H:%M:%S"
-    )
+    return datetime.now().strftime("%H:%M:%S")
 
 
 def full_time():
-    return datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def terminal_width():
@@ -102,178 +125,348 @@ def terminal_width():
 def center(value):
     width = terminal_width()
 
-    if len(value) >= width:
+    plain = value
+
+    for code in (
+        RESET,
+        BOLD,
+        DIM,
+        RED,
+        GREEN,
+        YELLOW,
+        BLUE,
+        MAGENTA,
+        CYAN,
+        WHITE
+    ):
+        plain = plain.replace(code, "")
+
+    if len(plain) >= width:
         return value[:width]
 
     return (
-        " " * ((width - len(value)) // 2)
+        " " * ((width - len(plain)) // 2)
         + value
     )
 
 
 def safe_hostname(address):
-
     try:
         return socket.gethostbyaddr(address)[0]
     except Exception:
         return "-"
 
 
-def get_interfaces():
+def init_database():
+    with db_lock:
+        db = sqlite3.connect(DB_FILE)
 
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                ip TEXT,
+                mac TEXT,
+                hostname TEXT,
+                first_seen TEXT,
+                last_seen TEXT
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                category TEXT,
+                source TEXT,
+                destination TEXT,
+                detail TEXT,
+                extra TEXT
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS dns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                source TEXT,
+                destination TEXT,
+                domain TEXT
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                protocol TEXT,
+                source TEXT,
+                destination TEXT,
+                source_port INTEGER,
+                destination_port INTEGER,
+                flags TEXT
+            )
+        """)
+
+        db.commit()
+        db.close()
+
+
+def db_execute(query, values=()):
     try:
-        interfaces = get_if_list()
+        with db_lock:
+            db = sqlite3.connect(DB_FILE)
+            db.execute(query, values)
+            db.commit()
+            db.close()
     except Exception:
-        interfaces = []
+        pass
 
+
+def get_interfaces():
     result = []
 
-    for interface in interfaces:
+    addresses = psutil.net_if_addrs()
+    stats = psutil.net_if_stats()
+
+    for name, items in addresses.items():
+        ipv4 = None
+        netmask = None
+        mac = None
+
+        for item in items:
+            family = item.family
+
+            if family == socket.AF_INET:
+                ipv4 = item.address
+                netmask = item.netmask
+
+            elif (
+                getattr(psutil, "AF_LINK", None) is not None
+                and family == psutil.AF_LINK
+            ):
+                mac = item.address
+
+        if not mac:
+            try:
+                mac = get_if_hwaddr(name)
+            except Exception:
+                mac = "-"
+
+        if not ipv4:
+            try:
+                ipv4 = get_if_addr(name)
+            except Exception:
+                ipv4 = "0.0.0.0"
+
+        is_up = False
 
         try:
-            address = get_if_addr(interface)
+            is_up = stats[name].isup
         except Exception:
-            address = "0.0.0.0"
-
-        try:
-            mac = get_if_hwaddr(interface)
-        except Exception:
-            mac = "00:00:00:00:00:00"
+            pass
 
         result.append(
             {
-                "name": interface,
-                "ip": address,
-                "mac": mac
+                "name": name,
+                "ip": ipv4,
+                "netmask": netmask,
+                "mac": mac or "-",
+                "up": is_up
             }
         )
 
     return result
 
 
-def choose_interface():
+def get_default_route_interface():
+    candidates = []
 
+    try:
+        route = conf.route.route("8.8.8.8")
+
+        if route:
+            iface = route[0]
+            source = route[1]
+            gateway = route[2]
+
+            return iface, source, gateway
+    except Exception:
+        pass
+
+    try:
+        route = conf.route.route("1.1.1.1")
+
+        if route:
+            iface = route[0]
+            source = route[1]
+            gateway = route[2]
+
+            return iface, source, gateway
+    except Exception:
+        pass
+
+    return None, None, None
+
+
+def choose_interface():
     global selected_interface
     global local_address
+    global local_netmask
+    global local_network
+    global local_gateway
 
     interfaces = get_interfaces()
 
-    usable = []
+    iface, source, gateway = get_default_route_interface()
 
-    for interface in interfaces:
+    if iface:
+        for item in interfaces:
+            if item["name"] == iface:
+                selected_interface = item["name"]
+                local_address = (
+                    source
+                    if source and source != "0.0.0.0"
+                    else item["ip"]
+                )
+                local_netmask = item["netmask"]
+                local_gateway = gateway
+                break
 
-        address = interface["ip"]
+    if not selected_interface:
+        usable = []
 
-        if address == "0.0.0.0":
-            continue
+        for item in interfaces:
+            address = item["ip"]
 
-        if address.startswith("127."):
-            continue
+            if not item["up"]:
+                continue
 
-        usable.append(interface)
+            if not address:
+                continue
 
-    if not usable:
+            if address == "0.0.0.0":
+                continue
 
-        print(
-            RED +
-            "No usable network interface found." +
-            RESET
-        )
+            if address.startswith("127."):
+                continue
 
-        print()
+            if ":" in address:
+                continue
 
-        print(
-            "Interfaces detected:"
-        )
+            usable.append(item)
 
-        for interface in interfaces:
-
+        if not usable:
             print(
-                f"  {interface['name']}  "
-                f"{interface['ip']}"
+                RED +
+                "No usable network interface found." +
+                RESET
             )
 
-        sys.exit(1)
+            print()
 
-    if len(usable) == 1:
+            for item in interfaces:
+                print(
+                    f"  {item['name']}  "
+                    f"{item['ip']}  "
+                    f"{'UP' if item['up'] else 'DOWN'}"
+                )
 
-        selected_interface = usable[0]["name"]
-        local_address = usable[0]["ip"]
+            sys.exit(1)
 
-        return
+        if len(usable) == 1:
+            item = usable[0]
+        else:
+            clear()
 
-    clear()
+            print(
+                BOLD +
+                CYAN +
+                "NETSCOPE NETWORK INTERFACE" +
+                RESET
+            )
 
-    print()
+            print()
 
-    print(
-        BOLD +
-        CYAN +
-        "NETSCOPE NETWORK INTERFACE" +
-        RESET
-    )
+            for index, item in enumerate(
+                usable,
+                start=1
+            ):
+                print(
+                    f"{CYAN}[{index}]{RESET} "
+                    f"{item['name']}"
+                )
+                print(
+                    f"    IP      : {item['ip']}"
+                )
+                print(
+                    f"    NETMASK : {item['netmask'] or '-'}"
+                )
+                print(
+                    f"    MAC     : {item['mac']}"
+                )
+                print()
 
-    print()
+            while True:
+                choice = input(
+                    "Select interface: "
+                ).strip()
 
-    for index, interface in enumerate(
-        usable,
-        start=1
-    ):
+                try:
+                    number = int(choice)
 
-        print(
-            f"{CYAN}[{index}]{RESET} "
-            f"{interface['name']}"
+                    if 1 <= number <= len(usable):
+                        item = usable[number - 1]
+                        break
+                except ValueError:
+                    pass
+
+                print(
+                    RED +
+                    "Invalid selection." +
+                    RESET
+                )
+
+        selected_interface = item["name"]
+        local_address = item["ip"]
+        local_netmask = item["netmask"]
+        local_gateway = gateway
+
+    if not local_netmask:
+        local_netmask = detect_netmask(
+            selected_interface,
+            local_address
         )
 
-        print(
-            f"    IP   : {interface['ip']}"
+    try:
+        local_network = ipaddress.ip_network(
+            f"{local_address}/{local_netmask}",
+            strict=False
         )
-
-        print(
-            f"    MAC  : {interface['mac']}"
-        )
-
-        print()
-
-    while True:
-
-        choice = input(
-            "Select interface: "
-        ).strip()
-
-        try:
-            number = int(choice)
-
-            if 1 <= number <= len(usable):
-
-                selected_interface = usable[
-                    number - 1
-                ]["name"]
-
-                local_address = usable[
-                    number - 1
-                ]["ip"]
-
-                return
-
-        except ValueError:
-            pass
-
-        print(
-            RED +
-            "Invalid selection." +
-            RESET
-        )
+    except Exception:
+        local_network = None
 
 
-def network_prefix():
+def detect_netmask(interface, address):
+    try:
+        for item in psutil.net_if_addrs().get(
+            interface,
+            []
+        ):
+            if item.family == socket.AF_INET:
+                if item.address == address:
+                    return item.netmask
+    except Exception:
+        pass
 
-    parts = local_address.split(".")
+    return "255.255.255.0"
 
-    if len(parts) != 4:
-        return None
 
-    return ".".join(parts[:3])
+def network_size():
+    if not local_network:
+        return 0
+
+    return local_network.num_addresses
 
 
 def register_device(
@@ -281,16 +474,15 @@ def register_device(
     mac="",
     hostname=""
 ):
-
     global device_count
 
     if not address:
         return
 
     with lock:
+        existing = devices.get(address)
 
-        if address not in devices:
-
+        if not existing:
             devices[address] = {
                 "ip": address,
                 "mac": mac or "-",
@@ -298,107 +490,147 @@ def register_device(
                 "first_seen": full_time(),
                 "last_seen": full_time(),
                 "events": 0,
-                "domains": 0
+                "domains": 0,
+                "packets": 0
             }
 
             device_count += 1
 
-        else:
-
             device = devices[address]
+
+        else:
+            device = existing
 
             if mac and mac != "-":
                 device["mac"] = mac
 
-            if (
-                hostname
-                and hostname != "-"
-            ):
+            if hostname and hostname != "-":
                 device["hostname"] = hostname
 
             device["last_seen"] = full_time()
 
+        device["packets"] += 1
+
 
 def arp_scan():
+    global arp_count
 
-    prefix = network_prefix()
-
-    if not prefix:
+    if not selected_interface:
         return
 
-    for number in range(1, 255):
+    if not local_network:
+        return
 
-        if not running:
-            return
+    if local_network.version != 4:
+        return
 
-        target = (
-            f"{prefix}.{number}"
+    if local_network.num_addresses > 4096:
+        event(
+            "INFO",
+            local_address,
+            "-",
+            f"Network too large for automatic ARP scan: {local_network}",
+            "DISCOVERY"
+        )
+        return
+
+    try:
+        packet = (
+            Ether(
+                dst="ff:ff:ff:ff:ff:ff"
+            )
+            /
+            ARP(
+                pdst=str(local_network)
+            )
         )
 
-        if target == local_address:
-            continue
+        answered, _ = srp(
+            packet,
+            iface=selected_interface,
+            timeout=2,
+            retry=1,
+            verbose=False
+        )
 
-        try:
+        for sent, received in answered:
+            if not running:
+                return
 
-            packet = (
-                Ether(
-                    dst="ff:ff:ff:ff:ff:ff"
+            ip = received.psrc
+            mac = received.hwsrc
+
+            hostname = safe_hostname(ip)
+
+            register_device(
+                ip,
+                mac,
+                hostname
+            )
+
+            with lock:
+                arp_count += 1
+
+            db_execute(
+                """
+                INSERT INTO devices(
+                    timestamp,
+                    ip,
+                    mac,
+                    hostname,
+                    first_seen,
+                    last_seen
                 )
-                /
-                ARP(
-                    pdst=target
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    full_time(),
+                    ip,
+                    mac,
+                    hostname,
+                    devices[ip]["first_seen"],
+                    devices[ip]["last_seen"]
                 )
             )
 
-            answer = srp_once(
-                packet,
-                timeout=0.35
+            event(
+                "ARP",
+                ip,
+                "-",
+                mac,
+                hostname
             )
 
-            if answer:
-
-                register_device(
-                    target,
-                    answer[0],
-                    safe_hostname(target)
-                )
-
-        except Exception:
-            continue
-
-
-def srp_once(packet, timeout=1):
-
-    from scapy.all import srp
-
-    answered, _ = srp(
-        packet,
-        timeout=timeout,
-        verbose=False,
-        iface=selected_interface
-    )
-
-    if not answered:
-        return None
-
-    result = answered[0]
-
-    return (
-        result[1].hwsrc,
-        result[1].psrc
-    )
+    except Exception as error:
+        event(
+            "ERROR",
+            "SYSTEM",
+            "-",
+            str(error),
+            "ARP"
+        )
 
 
 def discovery_loop():
+    first = True
 
     while running:
-
         try:
             arp_scan()
-        except Exception:
-            pass
+        except Exception as error:
+            event(
+                "ERROR",
+                "SYSTEM",
+                "-",
+                str(error),
+                "DISCOVERY"
+            )
 
-        time.sleep(10)
+        if first:
+            first = False
+            time.sleep(5)
+        else:
+            time.sleep(30)
 
 
 def event(
@@ -408,41 +640,63 @@ def event(
     detail,
     extra=""
 ):
-
     global last_event_id
 
     with lock:
-
         last_event_id += 1
 
-        events.append(
-            {
-                "id": last_event_id,
-                "time": now(),
-                "category": category,
-                "source": source,
-                "destination": destination,
-                "detail": detail,
-                "extra": extra
-            }
+        item = {
+            "id": last_event_id,
+            "time": now(),
+            "full_time": full_time(),
+            "category": category,
+            "source": source or "-",
+            "destination": destination or "-",
+            "detail": detail or "-",
+            "extra": extra or "-"
+        }
+
+        events.append(item)
+
+    db_execute(
+        """
+        INSERT INTO events(
+            timestamp,
+            category,
+            source,
+            destination,
+            detail,
+            extra
         )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            item["full_time"],
+            item["category"],
+            item["source"],
+            item["destination"],
+            item["detail"],
+            item["extra"]
+        )
+    )
 
 
 def domain_from_packet(packet):
-
     if not packet.haslayer(DNS):
         return None
 
     dns = packet[DNS]
 
-    if int(dns.qr) != 0:
+    try:
+        if int(dns.qr) != 0:
+            return None
+    except Exception:
         return None
 
     if not packet.haslayer(DNSQR):
         return None
 
     try:
-
         name = packet[DNSQR].qname
 
         if isinstance(name, bytes):
@@ -457,13 +711,11 @@ def domain_from_packet(packet):
             return None
 
         return name
-
     except Exception:
         return None
 
 
 def packet_source(packet):
-
     if packet.haslayer(IP):
         return packet[IP].src
 
@@ -474,7 +726,6 @@ def packet_source(packet):
 
 
 def packet_destination(packet):
-
     if packet.haslayer(IP):
         return packet[IP].dst
 
@@ -484,14 +735,50 @@ def packet_destination(packet):
     return None
 
 
-def process_packet(packet):
+def protocol_name(packet):
+    if packet.haslayer(TCP):
+        return "TCP"
 
+    if packet.haslayer(UDP):
+        return "UDP"
+
+    if packet.haslayer(ARP):
+        return "ARP"
+
+    if packet.haslayer(IP):
+        return "IPv4"
+
+    if packet.haslayer(IPv6):
+        return "IPv6"
+
+    return "OTHER"
+
+
+def process_packet(packet):
     global packet_count
     global dns_count
     global connection_count
+    global ipv4_count
+    global ipv6_count
+    global tcp_count
+    global udp_count
+    global bytes_count
 
     with lock:
         packet_count += 1
+        bytes_count += len(packet)
+
+        if packet.haslayer(IP):
+            ipv4_count += 1
+
+        if packet.haslayer(IPv6):
+            ipv6_count += 1
+
+        if packet.haslayer(TCP):
+            tcp_count += 1
+
+        if packet.haslayer(UDP):
+            udp_count += 1
 
     source = packet_source(packet)
     destination = packet_destination(packet)
@@ -502,9 +789,7 @@ def process_packet(packet):
     domain = domain_from_packet(packet)
 
     if domain and source:
-
         with lock:
-
             dns_count += 1
             domains[domain] += 1
 
@@ -520,65 +805,124 @@ def process_packet(packet):
             "DOMAIN"
         )
 
+        db_execute(
+            """
+            INSERT INTO dns(
+                timestamp,
+                source,
+                destination,
+                domain
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                full_time(),
+                source,
+                destination or "-",
+                domain
+            )
+        )
+
         return
 
-    if source and destination:
+    if not source or not destination:
+        return
 
-        if packet.haslayer(TCP):
+    if packet.haslayer(TCP):
+        sport = int(packet[TCP].sport)
+        dport = int(packet[TCP].dport)
 
-            sport = int(
-                packet[TCP].sport
+        flags = str(
+            packet[TCP].flags
+        )
+
+        with lock:
+            connection_count += 1
+            connections[dport] += 1
+
+            if source in devices:
+                devices[source]["events"] += 1
+
+        event(
+            "TCP",
+            source,
+            destination,
+            f"{sport} -> {dport}",
+            flags
+        )
+
+        db_execute(
+            """
+            INSERT INTO connections(
+                timestamp,
+                protocol,
+                source,
+                destination,
+                source_port,
+                destination_port,
+                flags
             )
-
-            dport = int(
-                packet[TCP].dport
-            )
-
-            flags = str(
-                packet[TCP].flags
-            )
-
-            with lock:
-                connection_count += 1
-                connections[dport] += 1
-
-            event(
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                full_time(),
                 "TCP",
                 source,
                 destination,
-                f"{sport} -> {dport}",
+                sport,
+                dport,
                 flags
             )
+        )
 
-        elif packet.haslayer(UDP):
+    elif packet.haslayer(UDP):
+        sport = int(packet[UDP].sport)
+        dport = int(packet[UDP].dport)
 
-            sport = int(
-                packet[UDP].sport
+        with lock:
+            connection_count += 1
+            connections[dport] += 1
+
+            if source in devices:
+                devices[source]["events"] += 1
+
+        event(
+            "UDP",
+            source,
+            destination,
+            f"{sport} -> {dport}",
+            "UDP"
+        )
+
+        db_execute(
+            """
+            INSERT INTO connections(
+                timestamp,
+                protocol,
+                source,
+                destination,
+                source_port,
+                destination_port,
+                flags
             )
-
-            dport = int(
-                packet[UDP].dport
-            )
-
-            with lock:
-                connection_count += 1
-                connections[dport] += 1
-
-            event(
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                full_time(),
                 "UDP",
                 source,
                 destination,
-                f"{sport} -> {dport}",
+                sport,
+                dport,
                 "UDP"
             )
+        )
 
 
 def capture_loop():
-
     global capture_error
 
     try:
-
         sniff(
             iface=selected_interface,
             prn=process_packet,
@@ -586,7 +930,6 @@ def capture_loop():
         )
 
     except Exception as error:
-
         with lock:
             capture_error = str(error)
 
@@ -600,9 +943,7 @@ def capture_loop():
 
 
 def device_label(address):
-
     with lock:
-
         device = devices.get(address)
 
         if not device:
@@ -610,16 +951,14 @@ def device_label(address):
 
         hostname = device["hostname"]
 
-        if hostname != "-":
+        if hostname and hostname != "-":
             return hostname
 
         return address
 
 
 def print_banner():
-
     print()
-
     print(
         center(
             BOLD +
@@ -628,7 +967,6 @@ def print_banner():
             RESET
         )
     )
-
     print(
         center(
             BOLD +
@@ -637,7 +975,6 @@ def print_banner():
             RESET
         )
     )
-
     print(
         center(
             BOLD +
@@ -646,7 +983,6 @@ def print_banner():
             RESET
         )
     )
-
     print(
         center(
             BOLD +
@@ -655,7 +991,6 @@ def print_banner():
             RESET
         )
     )
-
     print(
         center(
             BOLD +
@@ -664,7 +999,6 @@ def print_banner():
             RESET
         )
     )
-
     print(
         center(
             BOLD +
@@ -673,9 +1007,7 @@ def print_banner():
             RESET
         )
     )
-
     print()
-
     print(
         center(
             DIM +
@@ -683,29 +1015,39 @@ def print_banner():
             RESET
         )
     )
-
     print()
 
 
 def print_header():
-
-    print(
+    status = (
         GREEN +
         "● LIVE" +
-        RESET +
-        "  "
-        +
+        RESET
+    )
+
+    print(
+        status +
+        "  " +
         WHITE +
         "Interface: " +
         CYAN +
         str(selected_interface) +
         RESET +
-        "  "
-        +
+        "  " +
         WHITE +
         "IP: " +
         CYAN +
         local_address +
+        RESET
+    )
+
+    print(
+        DIM +
+        "Network: " +
+        str(local_network or "-") +
+        "   "
+        "Gateway: " +
+        str(local_gateway or "-") +
         RESET
     )
 
@@ -719,6 +1061,23 @@ def print_header():
         str(connection_count) +
         "   Devices: " +
         str(device_count) +
+        "   ARP: " +
+        str(arp_count) +
+        RESET
+    )
+
+    print(
+        DIM +
+        "IPv4: " +
+        str(ipv4_count) +
+        "   IPv6: " +
+        str(ipv6_count) +
+        "   TCP: " +
+        str(tcp_count) +
+        "   UDP: " +
+        str(udp_count) +
+        "   Bytes: " +
+        str(bytes_count) +
         RESET
     )
 
@@ -726,7 +1085,6 @@ def print_header():
 
 
 def print_devices():
-
     with lock:
         rows = list(devices.values())
 
@@ -744,18 +1102,18 @@ def print_devices():
         f"{'IP':<18}"
         f"{'HOSTNAME':<30}"
         f"{'MAC':<20}"
-        f"{'DOMAINS':<10}" +
+        f"{'DOMAINS':<10}"
+        f"{'PACKETS':<10}" +
         RESET
     )
 
     print(
         DIM +
-        "─" * 78 +
+        "─" * 88 +
         RESET
     )
 
     if not rows:
-
         print(
             DIM +
             "No devices discovered yet." +
@@ -763,7 +1121,6 @@ def print_devices():
         )
 
         print()
-
         return
 
     rows.sort(
@@ -771,7 +1128,6 @@ def print_devices():
     )
 
     for device in rows:
-
         hostname = device["hostname"]
 
         if len(hostname) > 28:
@@ -784,6 +1140,8 @@ def print_devices():
             f"{device['mac']:<20}" +
             CYAN +
             f"{device['domains']:<10}" +
+            WHITE +
+            f"{device['packets']:<10}" +
             RESET
         )
 
@@ -791,9 +1149,8 @@ def print_devices():
 
 
 def print_events():
-
     with lock:
-        rows = list(events)[-30:]
+        rows = list(events)[-25:]
 
     print(
         BOLD +
@@ -822,7 +1179,6 @@ def print_events():
     )
 
     if not rows:
-
         print(
             DIM +
             "No network events captured." +
@@ -830,19 +1186,14 @@ def print_events():
         )
 
         print()
-
         return
 
     for item in rows:
-
         source = device_label(
             item["source"]
         )
 
-        destination = item[
-            "destination"
-        ]
-
+        destination = item["destination"]
         detail = item["detail"]
 
         if len(source) > 20:
@@ -856,27 +1207,26 @@ def print_events():
 
         if item["category"] == "DNS":
             color = GREEN
-
         elif item["category"] == "ERROR":
             color = RED
-
         elif item["category"] == "TCP":
             color = CYAN
-
+        elif item["category"] == "ARP":
+            color = BLUE
         else:
             color = YELLOW
 
         print(
             WHITE +
-            f"{item['time']:<10}"
-            + color +
-            f"{item['category']:<8}"
-            + RESET +
+            f"{item['time']:<10}" +
+            color +
+            f"{item['category']:<8}" +
+            RESET +
             f"{source:<22}"
-            f"{destination:<18}"
-            + GREEN +
-            f"{detail:<38}"
-            + RESET +
+            f"{destination:<18}" +
+            GREEN +
+            f"{detail:<38}" +
+            RESET +
             f"{item['extra']:<12}"
         )
 
@@ -884,26 +1234,23 @@ def print_events():
 
 
 def print_domains():
-
     with lock:
-
         rows = sorted(
             domains.items(),
             key=lambda x: x[1],
             reverse=True
-        )[:10]
+        )[:12]
 
     print(
         BOLD +
         YELLOW +
-        "TOP DOMAINS" +
+        "TOP OBSERVED DOMAINS" +
         RESET
     )
 
     print()
 
     if not rows:
-
         print(
             DIM +
             "No observable DNS domains yet." +
@@ -911,14 +1258,12 @@ def print_domains():
         )
 
         print()
-
         return
 
     for domain, count in rows:
-
         print(
             CYAN +
-            f"{domain:<55}" +
+            f"{domain:<60}" +
             RESET +
             WHITE +
             str(count) +
@@ -928,16 +1273,63 @@ def print_domains():
     print()
 
 
-def render():
+def export_json():
+    with lock:
+        data = {
+            "exported_at": full_time(),
+            "network": {
+                "interface": selected_interface,
+                "local_ip": local_address,
+                "netmask": local_netmask,
+                "network": str(local_network)
+                if local_network
+                else None,
+                "gateway": local_gateway
+            },
+            "statistics": {
+                "packets": packet_count,
+                "dns": dns_count,
+                "connections": connection_count,
+                "devices": device_count,
+                "arp": arp_count,
+                "ipv4": ipv4_count,
+                "ipv6": ipv6_count,
+                "tcp": tcp_count,
+                "udp": udp_count,
+                "bytes": bytes_count
+            },
+            "devices": list(
+                devices.values()
+            ),
+            "domains": dict(domains),
+            "events": list(events)
+        }
 
+    try:
+        with open(
+            EXPORT_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                data,
+                file,
+                indent=2,
+                ensure_ascii=False
+            )
+
+        return True
+    except Exception:
+        return False
+
+
+def render():
     clear()
 
     print_banner()
-
     print_header()
 
     if capture_error:
-
         print(
             RED +
             "CAPTURE ERROR" +
@@ -953,15 +1345,21 @@ def render():
         print()
 
     print_devices()
-
     print_events()
-
     print_domains()
 
     print(
         DIM +
         "Only traffic observable by this interface is displayed. "
-        "HTTPS paths and encrypted DNS contents are not reconstructed." +
+        "Encrypted HTTPS paths and encrypted DNS contents are not reconstructed." +
+        RESET
+    )
+
+    print()
+
+    print(
+        DIM +
+        "Press CTRL+C to stop and export the current session." +
         RESET
     )
 
@@ -969,7 +1367,6 @@ def render():
 
 
 def startup():
-
     clear()
 
     print_banner()
@@ -981,32 +1378,36 @@ def startup():
     )
 
     if is_admin():
-
         print(
             GREEN +
-            "✓ Administrator privileges detected" +
+            "✓ Elevated privileges detected" +
             RESET
         )
-
     else:
-
         print(
             YELLOW +
-            "⚠ Administrator privileges not detected" +
+            "⚠ Elevated privileges not detected" +
             RESET
         )
 
-        print(
-            DIM +
-            "Packet capture may fail without elevation." +
-            RESET
-        )
+        if os.name == "nt":
+            print(
+                DIM +
+                "Run PowerShell/CMD as Administrator for packet capture." +
+                RESET
+            )
+        else:
+            print(
+                DIM +
+                "Run with sudo/root if packet capture is denied." +
+                RESET
+            )
 
     print()
 
     print(
         WHITE +
-        "Detecting network interfaces..." +
+        "Detecting active network..." +
         RESET
     )
 
@@ -1014,25 +1415,82 @@ def startup():
 
     print(
         GREEN +
-        "✓ Interface selected:" +
+        "✓ Interface:" +
         RESET,
         selected_interface
     )
 
     print(
-        WHITE +
+        GREEN +
         "✓ Local IP:" +
         RESET,
         local_address
     )
 
+    print(
+        GREEN +
+        "✓ Netmask:" +
+        RESET,
+        local_netmask or "-"
+    )
+
+    print(
+        GREEN +
+        "✓ Network:" +
+        RESET,
+        local_network or "-"
+    )
+
+    print(
+        GREEN +
+        "✓ Gateway:" +
+        RESET,
+        local_gateway or "-"
+    )
+
     print()
+
+    if local_network:
+        if local_network.num_addresses <= 4096:
+            print(
+                GREEN +
+                "✓ Automatic LAN discovery available" +
+                RESET
+            )
+        else:
+            print(
+                YELLOW +
+                "⚠ LAN is larger than automatic discovery limit" +
+                RESET
+            )
+
+    print()
+
+    init_database()
 
     time.sleep(1)
 
 
-def main():
+def save_session():
+    export_json()
 
+    print()
+
+    if os.path.exists(EXPORT_FILE):
+        print(
+            GREEN +
+            f"✓ Exported: {EXPORT_FILE}" +
+            RESET
+        )
+
+    print(
+        GREEN +
+        f"✓ Database: {DB_FILE}" +
+        RESET
+    )
+
+
+def main():
     global running
 
     startup()
@@ -1055,38 +1513,43 @@ def main():
 
     last_packet_count = -1
     last_device_count = -1
+    last_dns_count = -1
+    last_connection_count = -1
 
     try:
-
         while running:
-
             with lock:
-
                 packets = packet_count
                 current_devices = device_count
+                current_dns = dns_count
+                current_connections = connection_count
+                current_error = capture_error
 
             if (
                 packets != last_packet_count
-                or
-                current_devices != last_device_count
-                or
-                capture_error
+                or current_devices != last_device_count
+                or current_dns != last_dns_count
+                or current_connections != last_connection_count
+                or current_error
             ):
-
                 render()
 
                 last_packet_count = packets
                 last_device_count = current_devices
+                last_dns_count = current_dns
+                last_connection_count = current_connections
 
-            time.sleep(0.25)
+            time.sleep(0.5)
 
     except KeyboardInterrupt:
+        running = False
 
+    finally:
         running = False
 
         clear()
 
-        print()
+        print_banner()
 
         print(
             center(
@@ -1117,9 +1580,23 @@ def main():
 
         print(
             center(
-                f"Devices discovered: {device_count}"
+                WHITE +
+                f"Connections: {connection_count}" +
+                RESET
             )
         )
+
+        print(
+            center(
+                WHITE +
+                f"Devices discovered: {device_count}" +
+                RESET
+            )
+        )
+
+        print()
+
+        save_session()
 
         print()
 
